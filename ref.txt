@@ -1,0 +1,209 @@
+#include <iostream>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <vector>
+#include <cstring>
+#include <cmqc.h>
+
+// 互斥锁和条件变量用于线程间通信
+std::mutex mtx;
+std::condition_variable cv;
+bool newMessageAvailable = false;
+std::vector<std::string> messages;
+
+void checkMQICompletion(MQLONG completionCode, MQLONG reasonCode, const char* operation) {
+    if (completionCode != MQCC_OK) {
+        std::cerr << "Error in " << operation << ". Reason code: " << reasonCode << std::endl;
+        exit(1);
+    }
+    std::cout << operation << " completed successfully. Completion code: " << completionCode << std::endl;
+}
+
+// 监听器线程函数
+void listenerThread(MQHCONN hConn, MQHOBJ hObj) {
+    MQMD md = {MQMD_DEFAULT}; // 消息描述符
+    MQGMO gmo = {MQGMO_DEFAULT}; // 获取消息选项
+    MQBYTE buffer[256]; // 缓冲区
+    MQLONG bufferLength = sizeof(buffer);
+    MQLONG messageLength;
+    MQLONG compCode;
+    MQLONG reason;
+
+    gmo.Options = MQGMO_WAIT | MQGMO_FAIL_IF_QUIESCING;
+    gmo.WaitInterval = 5000; // 5秒超时
+
+    while (true) {
+        MQGET(hConn, hObj, &md, &gmo, bufferLength, buffer, &messageLength, &compCode, &reason);
+
+        std::unique_lock<std::mutex> lock(mtx);
+        if (compCode == MQCC_OK) {
+            std::string message(reinterpret_cast<char*>(buffer), messageLength);
+            messages.push_back(message);
+            newMessageAvailable = true;
+            cv.notify_one();
+        } else if (compCode == MQCC_WARNING && reason == MQRC_NO_MSG_AVAILABLE) {
+            // No message available, continue waiting
+        } else {
+            checkMQICompletion(compCode, reason, "MQGET");
+        }
+    }
+}
+
+// 消息处理线程函数
+void processMessages() {
+    while (true) {
+        std::unique_lock<std::mutex> lock(mtx);
+        cv.wait(lock, []{ return newMessageAvailable; });
+
+        while (!messages.empty()) {
+            std::string message = messages.back();
+            messages.pop_back();
+            std::cout << "Processing message: " << message << std::endl;
+        }
+        newMessageAvailable = false;
+    }
+}
+
+int main() {
+    MQHCONN hConn; // 连接句柄
+    MQHOBJ hObj; // 对象句柄
+    MQLONG compCode;
+    MQLONG reason;
+
+    // 连接到队列管理器
+    MQCONN("QM1", &hConn, &compCode, &reason);
+    checkMQICompletion(compCode, reason, "MQCONN");
+
+    // 打开队列
+    MQOD od = {MQOD_DEFAULT};
+    strcpy(od.ObjectName, "QUEUE1");
+    MQOPEN(hConn, &od, MQOO_INPUT_AS_Q_DEF, &hObj, &compCode, &reason);
+    checkMQICompletion(compCode, reason, "MQOPEN");
+
+    // 启动监听器线程
+    std::thread listener(listenerThread, hConn, hObj);
+
+    // 启动消息处理线程
+    std::thread processor(processMessages);
+
+    // 等待线程完成（实际上，这些线程会一直运行）
+    listener.join();
+    processor.join();
+
+    // 关闭队列
+    MQCLOSE(hConn, &hObj, MQCO_NONE, &compCode, &reason);
+    checkMQICompletion(compCode, reason, "MQCLOSE");
+
+    // 断开队列管理器
+    MQDISC(&hConn, &compCode, &reason);
+    checkMQICompletion(compCode, reason, "MQDISC");
+
+    return 0;
+}
+
+#include <iostream>
+#include <cstring>
+#include <cmqc.h>
+#include <cmqxc.h>
+#include <stdexcept>
+
+#define BUFFER_LENGTH 1024  // 自定义缓冲区长度
+
+class MQManager {
+public:
+    MQManager(const char* qManagerName, const char* channelName, const char* connName)
+            : hConn(MQHC_UNUSABLE_HCONN), hObj(MQHO_UNUSABLE_HOBJ) {
+        // 设置连接参数
+        strncpy(cd.ChannelName, channelName, MQ_CHANNEL_NAME_LENGTH);
+        strncpy(cd.ConnectionName, connName, MQ_CONN_NAME_LENGTH);
+
+        // 连接选项中指定通道定义
+        cno.ClientConnPtr = &cd;
+
+        // 连接到队列管理器
+        MQCONNX((MQCHAR*)qManagerName, &cno, &hConn, &completionCode, &reasonCode);
+        checkMQICompletion("connect to queue manager");
+
+        // 如果连接失败，hConn 应该是 MQHC_UNUSABLE_HCONN
+        if (hConn == MQHC_UNUSABLE_HCONN) {
+            throw std::runtime_error("Failed to connect to queue manager");
+        }
+    }
+
+    ~MQManager() {
+        if (hObj != MQHO_UNUSABLE_HOBJ) {
+            // 关闭队列
+            MQCLOSE(hConn, &hObj, MQCO_NONE, &completionCode, &reasonCode);
+            checkMQICompletion("close queue");
+        }
+        if (hConn != MQHC_UNUSABLE_HCONN) {
+            // 断开连接
+            MQDISC(&hConn, &completionCode, &reasonCode);
+            checkMQICompletion("disconnect from queue manager");
+        }
+    }
+
+    void openQueue(const char* queueName) {
+        // 设置队列名称
+        strncpy(od.ObjectName, queueName, MQ_Q_NAME_LENGTH);
+
+        // 打开队列
+        MQOPEN(hConn, &od, MQOO_OUTPUT, &hObj, &completionCode, &reasonCode);
+        checkMQICompletion("open queue");
+    }
+
+    void putMessage(const char* message) {
+        if (hObj == MQHO_UNUSABLE_HOBJ) {
+            throw std::runtime_error("Queue is not open");
+        }
+
+        // 准备消息内容
+        MQBYTE buffer[BUFFER_LENGTH];
+        strncpy(reinterpret_cast<char*>(buffer), message, BUFFER_LENGTH);
+
+        // 发布消息
+        MQLONG messageLength = strlen(message);
+        MQPUT(hConn, hObj, &md, &pmo, messageLength, buffer, &completionCode, &reasonCode);
+        checkMQICompletion("put message to queue");
+
+        if (completionCode == MQCC_OK) {
+            std::cout << "Message successfully put to queue" << std::endl;
+        }
+    }
+
+private:
+    MQHCONN hConn;  // MQ连接句柄
+    MQHOBJ hObj;    // MQ对象句柄
+    MQOD od = {MQOD_DEFAULT};  // 对象描述符
+    MQMD md = {MQMD_DEFAULT};  // 消息描述符
+    MQPMO pmo = {MQPMO_DEFAULT};  // 发布消息选项
+    MQLONG completionCode;  // 完成代码
+    MQLONG reasonCode;  // 原因代码
+    MQCNO cno = {MQCNO_DEFAULT};  // 连接选项
+    MQCD cd = {MQCD_CLIENT_CONN_DEFAULT};  // 通道定义
+
+    void checkMQICompletion(const char* operation) {
+        if (completionCode != MQCC_OK) {
+            std::cerr << operation << " failed, Reason code: " << reasonCode << std::endl;
+            throw std::runtime_error(std::string(operation) + " failed");
+        }
+        std::cout << operation << " succeed" << std::endl;
+    }
+};
+
+int main() {
+    try {
+        MQManager mqManager("QM2", "USER.QM2.TESTCHANNEL", "192.168.72.135(1515)");
+
+        mqManager.openQueue("TEST_QUEUE");
+        mqManager.putMessage("Hello, IBM MQ!");
+
+        // 睡眠一段时间以观察结果
+        // std::this_thread::sleep_for(std::chrono::seconds(100));
+    } catch (const std::exception& ex) {
+        std::cerr << "Exception: " << ex.what() << std::endl;
+    }
+
+    return 0;
+}
